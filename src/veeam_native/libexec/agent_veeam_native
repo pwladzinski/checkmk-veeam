@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Pawel Wladzinski
+"""Read-only Veeam B&R REST collector for Checkmk 2.4 and 2.5."""
+import argparse
+import json
+import sys
+import time
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlsplit
+import re
+try:
+    import requests
+except ImportError:
+    requests = None
+
+VERSION = '1.0.0'
+PAGE_SIZE = 200
+EMPTY_ID = '00000000-0000-0000-0000-000000000000'
+MAX_BODY = 16 * 1024 * 1024
+
+class Failure(Exception):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+def stamp(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            return None
+        return dt.timestamp()
+    except ValueError:
+        return None
+
+def simple(value, keys):
+    return {k: value[k] for k in keys if isinstance(value, dict) and k in value and isinstance(value[k], (str, int, float, bool, type(None)))}
+
+def load_limited(response):
+    raw = response.read(MAX_BODY + 1)
+    if len(raw) > MAX_BODY:
+        raise Failure('Response too large')
+    try:
+        return json.loads(raw)
+    except (ValueError, UnicodeError):
+        raise Failure('Invalid JSON response') from None
+
+class Client:
+    """REST client consistent with the verified Veeam API discovery probe.
+
+    Requests keeps header spelling and default HTTP behavior identical to the
+    known-working probe, unlike the previous urllib.request implementation.
+    """
+    def __init__(self, opts):
+        if requests is None:
+            raise Failure('Missing Python requests module in the Checkmk site; install requests for site Python')
+        target = (getattr(opts, 'host', None) or getattr(opts, 'url', None) or '').strip()
+        if not target:
+            raise Failure('Missing Veeam server address')
+        if '://' not in target:
+            target = 'https://' + target
+        try:
+            parts = urlsplit(target)
+            legacy_port = parts.port
+        except ValueError:
+            raise Failure('Invalid Veeam server address or port') from None
+        if (parts.scheme != 'https' or not parts.hostname or parts.username or parts.password
+                or parts.query or parts.fragment or parts.path not in ('', '/')):
+            raise Failure('Enter hostname/IP only (HTTPS is used automatically); no paths or credentials')
+        port = getattr(opts, 'port', None)
+        if port is None:
+            port = legacy_port or 9419
+        if not (1 <= port <= 65535):
+            raise Failure('Veeam REST API port must be between 1 and 65535')
+        hostname = parts.hostname
+        if ':' in hostname and not hostname.startswith('['):
+            hostname = '[' + hostname + ']'
+        self.root = 'https://%s:%s' % (hostname, port)
+        self.api_version = opts.api_version
+        self.timeout = opts.timeout
+        self.deadline = time.monotonic() + opts.budget
+        self.session = requests.Session()
+        self.request_count = 0
+        # Always pass verify explicitly in every request. The process may have
+        # REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE configured by Checkmk, and requests
+        # will otherwise override Session.verify during environment merging.
+        self.verify_tls = False if opts.insecure else (opts.ca_file or True)
+        self.session.verify = self.verify_tls
+        if opts.insecure:
+            from urllib3.exceptions import InsecureRequestWarning
+            import warnings
+            warnings.filterwarnings('ignore', category=InsecureRequestWarning)
+        self.session.headers.update({'x-api-version': opts.api_version, 'Accept': 'application/json'})
+        self.authenticate(opts.username, opts.password)
+
+    @staticmethod
+    def error_details(response):
+        """Expose server validation message, but never log full response JSON."""
+        if not response.content:
+            return ''
+        message = ''
+        try:
+            body = response.json()
+            if isinstance(body, dict):
+                for key in ('message', 'detail', 'title', 'error_description', 'errorCode', 'error'):
+                    value = body.get(key)
+                    if isinstance(value, str) and value:
+                        message = value
+                        break
+            elif isinstance(body, str):
+                message = body
+        except (ValueError, UnicodeError):
+            # HTML / proxy responses can leak private details; do not show them.
+            return ''
+        # Keep only simple one-line diagnostic text; strip credential-like values.
+        message = re.sub(r'[\r\n\t]+', ' ', message)
+        message = re.sub(r'(?i)(token|password|secret|authorization)\s*[:=]\s*[^ ,;]+', r'\1=[redacted]', message)
+        return message[:160]
+
+    def request(self, path, params=None, payload=None, authorization=True):
+        remain = self.deadline - time.monotonic()
+        if remain <= 0:
+            raise Failure('Collection time budget exceeded')
+        try:
+            # Using requests.Session, as in the proven API probe, avoids
+            # differences in how urllib.request serializes HTTP headers.
+            if payload is not None:
+                response = self.session.post(self.root + path, data=payload,
+                    timeout=min(self.timeout, max(1, remain)), allow_redirects=False,
+                    verify=self.verify_tls)
+            else:
+                response = self.session.get(self.root + path, params=params,
+                    timeout=min(self.timeout, max(1, remain)), allow_redirects=False,
+                    verify=self.verify_tls)
+        except requests.exceptions.SSLError:
+            if self.verify_tls is False:
+                raise Failure('%s: TLS handshake failed even with certificate validation disabled (check protocol, reverse proxy or TLS configuration)' % path) from None
+            raise Failure('%s: TLS certificate verification failed; enable Skip TLS certificate validation or configure CA certificate' % path) from None
+        except requests.exceptions.RequestException as exc:
+            raise Failure('%s: %s' % (path, type(exc).__name__)) from None
+        self.request_count += 1
+        if not (200 <= response.status_code < 300):
+            detail = self.error_details(response)
+            raise Failure('%s: HTTP %s%s' % (path, response.status_code,
+                (' - ' + detail) if detail else ''), status=response.status_code)
+        if len(response.content) > MAX_BODY:
+            raise Failure('%s: response too large' % path)
+        try:
+            return response.json()
+        except (ValueError, UnicodeError):
+            raise Failure('%s: invalid JSON response' % path) from None
+
+    def authenticate(self, username, password):
+        if not username or not password:
+            raise Failure('Missing REST credentials')
+        # Exactly the OAuth form used by the earlier successful probe.
+        result = self.request('/api/oauth2/token', payload={
+            'grant_type': 'password', 'username': username, 'password': password},
+            authorization=False)
+        if not isinstance(result, dict) or not isinstance(result.get('access_token'), str):
+            raise Failure('OAuth2 token missing')
+        self.session.headers['Authorization'] = 'Bearer ' + result['access_token']
+
+    def get(self, path):
+        return self.request(path)
+
+    def listing(self, path, max_pages=100, filters=None):
+        collected = []
+        seen = set()
+        offset = 0
+        for _ in range(max_pages):
+            params = {'skip': offset, 'limit': PAGE_SIZE}
+            if filters:
+                params.update(filters)
+            resp = self.request(path, params=params)
+            if isinstance(resp, list):
+                values = resp
+                total = len(values)
+            elif isinstance(resp, dict):
+                values = resp.get('data')
+                if values is None:
+                    values = resp.get('items')
+                if not isinstance(values, list):
+                    raise Failure('%s: no list in API response' % path)
+                pagination = resp.get('pagination')
+                total = pagination.get('total') if isinstance(pagination, dict) else None
+                if total is None:
+                    total = resp.get('totalCount', resp.get('count'))
+            else:
+                raise Failure('%s: unexpected response' % path)
+            fresh = 0
+            for item in values:
+                if not isinstance(item, dict):
+                    continue
+                ident = str(item.get('id') or '')
+                if ident and ident in seen:
+                    continue
+                if ident:
+                    seen.add(ident)
+                collected.append(item)
+                fresh += 1
+            offset += len(values)
+            if (len(values) == 0 or fresh == 0 or
+                    (isinstance(total, int) and offset >= total) or
+                    len(values) < PAGE_SIZE):
+                return collected
+        raise Failure('%s: pagination limit reached; inventory incomplete' % path)
+
+def latest_sessions(sessions, days):
+    """Select latest VBR custom-platform execution per logical job.
+
+    PlatformBackupJob is not necessarily Morpheus; PlatformSnapshotJob can
+    represent Kasten policies, but that classification is not guaranteed for
+    other custom-platform integrations. We preserve the native session kind.
+
+    Some integrations provide no jobId (or the all-zero UUID). For snapshot
+    policies only, fall back to the policy/session name so we can detect them
+    without creating one service for every execution.
+    """
+    cutoff = time.time() - days * 86400
+    found = {'PlatformBackupJob': {}, 'PlatformSnapshotJob': {}, 'EndpointBackup': {}}
+    for session in sessions:
+        if not isinstance(session, dict) or session.get('platformName') != 'CustomPlatform':
+            continue
+        kind = session.get('sessionType')
+        if kind not in found:
+            continue
+        started = stamp(session.get('creationTime'))
+        if started is None or started < cutoff:
+            continue
+        name = str(session.get('name') or '').strip()
+        job_id = session.get('jobId')
+        if kind == 'PlatformSnapshotJob' and name:
+            # Kasten policy executions may have differing session/job IDs.
+            # One stable service per policy name, not per execution.
+            key = ('policy', name)
+        elif job_id and job_id != EMPTY_ID:
+            key = ('job', str(job_id))
+        else:
+            continue
+        record = simple(session, ('id', 'jobId', 'name', 'platformName',
+            'sessionType', 'state', 'creationTime', 'endTime', 'progressPercent'))
+        if isinstance(session.get('result'), dict):
+            record['result'] = simple(session['result'], ('result', 'message'))
+        previous = found[kind].get(key)
+        if previous is None or started > (stamp(previous.get('creationTime')) or 0):
+            found[kind][key] = record
+    return tuple(list(found[kind].values()) for kind in
+                 ('PlatformBackupJob', 'PlatformSnapshotJob', 'EndpointBackup'))
+
+
+def add_custom_jobs(unified, sessions, kind, backup_index):
+    """Merge policy-level executions into standard job services by job ID."""
+    for session in sessions:
+        job_id = session.get('jobId')
+        raw_name = session.get('name') or backup_index.get(job_id, {}).get('name')
+        if not raw_name:
+            continue
+        # Snapshot policies are grouped by name even if underlying job IDs
+        # rotate. Parent backup jobs continue to use their stable Veeam jobId.
+        stable_id = ('snapshot:' + str(raw_name) if kind == 'PlatformSnapshotJob'
+                     else str(job_id) if job_id and job_id != EMPTY_ID else None)
+        if not stable_id:
+            continue
+        if any(j.get('id') == stable_id for j in unified):
+            continue
+        backup = backup_index.get(job_id, {})
+        name = str(raw_name)
+        # A snapshot session is not necessarily Kasten. The "Kasten" label is
+        # only inferred when the *name* explicitly identifies that platform.
+        is_kasten = kind == 'PlatformSnapshotJob' and ('kasten' in name.lower() or 'k10' in name.lower())
+        job_type = ('KastenPolicy' if is_kasten else 'CustomPlatformSnapshot') if kind == 'PlatformSnapshotJob' else 'CustomPlatformBackup'
+        record = {
+            'id': stable_id, 'name': name, 'type': job_type, 'source': 'session',
+            'sessionType': kind, 'status': session.get('state'),
+            'lastResult': session.get('result', {}).get('result'),
+            'lastRun': session.get('creationTime'), 'endTime': session.get('endTime'),
+            'message': session.get('result', {}).get('message'),
+            'repositoryName': backup.get('repositoryName'),
+            'progressPercent': session.get('progressPercent'),
+        }
+        unified.append(record)
+
+
+def disambiguate_duplicate_names(jobs):
+    """Keep stable original names where unique; disambiguate genuine collisions."""
+    counts = {}
+    for job in jobs:
+        name = str(job.get('name') or '')
+        counts[name] = counts.get(name, 0) + 1
+    for job in jobs:
+        name = str(job.get('name') or '')
+        if counts.get(name, 0) > 1:
+            same_name = [other for other in jobs if str(other.get('name') or '').split(' [')[0] == name]
+            session_type = job.get('sessionType')
+            if session_type == 'PlatformSnapshotJob' and sum(x.get('sessionType') == session_type for x in same_name) == 1:
+                suffix = 'snapshot'
+            elif session_type == 'PlatformBackupJob' and sum(x.get('sessionType') == session_type for x in same_name) == 1:
+                suffix = 'backup'
+            else:
+                suffix = str(job.get('id', 'unknown'))[:8]
+            job['name'] = '%s [%s]' % (name, suffix)
+
+def emit(name, obj):
+    print('<<<veeam_native_%s:sep(0)>>>' % name)
+    print(json.dumps(obj, separators=(',', ':'), ensure_ascii=True))
+
+def run(opts):
+    started = time.monotonic()
+    health = {'version': VERSION, 'success': False, 'sources': {}, 'errors': [], 'collected_at':datetime.now(timezone.utc).isoformat()}
+    data = {}
+    try:
+        api = Client(opts)
+        health['success'] = True
+    except Failure as exc:
+        health['errors'].append(str(exc))
+        health['duration'] = round(time.monotonic()-started, 2)
+        emit('api', health)
+        return 0
+    def collect(key, path, is_list=False, enabled=True, filters=None):
+        if not enabled:
+            return
+        try:
+            val = api.listing(path, filters=filters) if is_list else api.get(path)
+            health['sources'][key] = {'ok': True, 'count': len(val) if is_list else 1}
+            data[key] = val
+        except Failure as exc:
+            health['sources'][key] = {'ok': False, 'restricted': exc.status == 403, 'error': str(exc)[:200]}
+            health['errors'].append('%s: %s' % (key, exc))
+
+    # Monitor jobs, not historical backups/VM objects. Veeam does not expose
+    # HPE Morpheus jobs through /jobs/states, so use their execution sessions.
+    # Server-side filters avoid downloading years of unrelated Veeam sessions.
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=opts.history_days)).replace(microsecond=0)
+    session_filters = {
+        'typeFilter': 'PlatformBackupJob',
+        'createdAfterFilter': cutoff.isoformat().replace('+00:00', 'Z'),
+        'orderColumn': 'CreationTime',
+        'orderAsc': 'false',
+    }
+    collect('jobs', '/api/v1/jobs/states', True)
+    collect('sessions', '/api/v1/sessions', True, filters=session_filters)
+    # Kasten policies (and potentially other custom hypervisor snapshot jobs)
+    # are not listed by /jobs/states; VBR exposes their executions here.
+    if not opts.skip_snapshot_jobs:
+        snapshot_filters = dict(session_filters)
+        snapshot_filters['typeFilter'] = 'PlatformSnapshotJob'
+        collect('snapshot_sessions', '/api/v1/sessions', True, filters=snapshot_filters)
+    if opts.monitor_vm_sessions:
+        vm_filters = dict(session_filters)
+        vm_filters['typeFilter'] = 'EndpointBackup'
+        collect('vm_sessions', '/api/v1/sessions', True, filters=vm_filters)
+    collect('repositories', '/api/v1/backupInfrastructure/repositories/states', True)
+
+    # Opt-in scopes only; do not fetch these resources on routine polls.
+    collect('backups', '/api/v1/backups', True, opts.monitor_backup_catalog)
+    collect('objects', '/api/v1/backupObjects', True, opts.monitor_protected_objects)
+    collect('proxies', '/api/v1/backupInfrastructure/proxies/states', True, opts.monitor_infrastructure)
+    collect('managed_servers', '/api/v1/backupInfrastructure/managedServers', True, opts.monitor_infrastructure)
+    collect('scaleout', '/api/v1/backupInfrastructure/scaleOutRepositories', True, opts.monitor_infrastructure)
+    collect('wan', '/api/v1/backupInfrastructure/wanAccelerators', True, opts.monitor_infrastructure)
+    collect('server', '/api/v1/serverInfo', enabled=opts.monitor_api_details)
+    collect('license', '/api/v1/license', enabled=opts.monitor_api_details)
+    collect('config', '/api/v1/configBackup', enabled=opts.monitor_api_details)
+    collect('security', '/api/v1/securityAnalyzer/bestPractices', True, opts.monitor_security)
+    collect('replicas', '/api/v1/replicas', True, opts.monitor_replicas)
+    # Build a unified inventory. A successful backup session is not a configured-job record.
+    unified = []
+    for raw in data.get('jobs', []):
+        v = simple(raw, ('id','name','type','status','lastResult','lastRun','repositoryName','progressPercent'))
+        v['source'] = 'configured'
+        unified.append(v)
+    custom_backups, _, _ = latest_sessions(data.get('sessions', []), opts.history_days)
+    _, snapshot_jobs, _ = latest_sessions(data.get('snapshot_sessions', []), opts.history_days)
+    _, _, vm_sessions = latest_sessions(data.get('vm_sessions', []), opts.history_days) if opts.monitor_vm_sessions else ([], [], [])
+    backup_index = {}
+    for b in data.get('backups', []):
+        if b.get('platformName') != 'CustomPlatform': continue
+        ident = b.get('jobId')
+        if ident: backup_index[ident] = b
+    add_custom_jobs(unified, custom_backups, 'PlatformBackupJob', backup_index)
+    add_custom_jobs(unified, snapshot_jobs, 'PlatformSnapshotJob', backup_index)
+    disambiguate_duplicate_names(unified)
+    health['counts'] = {
+        'jobs': len(unified) if 'jobs' in data and 'sessions' in data else None,
+        'custom_platform_backup_jobs': len(custom_backups) if 'sessions' in data else None,
+        'custom_platform_snapshot_jobs': len(snapshot_jobs) if 'snapshot_sessions' in data else None,
+        'custom_platform_object_sessions': len(vm_sessions) if 'vm_sessions' in data else None,
+    }
+    health['request_count'] = api.request_count
+    health['duration'] = round(time.monotonic()-started, 2)
+    emit('api', health)
+    if 'jobs' in data or 'sessions' in data: emit('jobs', unified)
+    if 'vm_sessions' in data: emit('morpheus_vms', vm_sessions)
+    for key in ('backups','objects','repositories','proxies','managed_servers','scaleout','wan','server','license','config','security','replicas'):
+        if key in data: emit(key, data[key])
+    return 0
+
+def main():
+    parser = argparse.ArgumentParser()
+    address = parser.add_mutually_exclusive_group(required=True)
+    address.add_argument('--host', help='IP address or DNS hostname; HTTPS is automatic')
+    address.add_argument('--url', help='Legacy URL parameter for existing integrations')
+    parser.add_argument('--port', type=int, default=None, help='REST API port (default: 9419)')
+    parser.add_argument('--username', required=True)
+    parser.add_argument('--password', required=True)
+    parser.add_argument('--api-version', default='1.3-rev2')
+    parser.add_argument('--insecure', action='store_true')
+    parser.add_argument('--ca-file')
+    parser.add_argument('--timeout', type=int, default=15)
+    parser.add_argument('--budget', type=int, default=180)
+    parser.add_argument('--history-days', type=int, default=14)
+    parser.add_argument('--skip-snapshot-jobs', action='store_true')
+    parser.add_argument('--monitor-vm-sessions', action='store_true')
+    parser.add_argument('--monitor-backup-catalog', action='store_true')
+    parser.add_argument('--monitor-protected-objects', action='store_true')
+    parser.add_argument('--monitor-infrastructure', action='store_true')
+    parser.add_argument('--monitor-api-details', action='store_true')
+    parser.add_argument('--monitor-security', action='store_true')
+    parser.add_argument('--monitor-replicas', action='store_true')
+    opts = parser.parse_args()
+    if not (1 <= opts.timeout <= 120 and 30 <= opts.budget <= 900 and 1 <= opts.history_days <= 90 and (opts.port is None or 1 <= opts.port <= 65535)):
+        parser.error('invalid timeout, budget or history range')
+    return run(opts)
+
+if __name__ == '__main__':
+    sys.exit(main())
